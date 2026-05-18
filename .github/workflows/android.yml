@@ -82,4 +82,4 @@ jobs:
           repository: sharath-5br2r/patched-apks-builder
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           files: LeviLauncher-release.apk
-          tag_name: LeviLauncher
+          tag_name: all
