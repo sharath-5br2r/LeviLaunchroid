@@ -4,7 +4,6 @@ import android.content.ClipData;
 import android.content.Context;
 import android.content.Intent;
 import android.database.Cursor;
-import android.graphics.Color;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
@@ -34,8 +33,10 @@ import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
@@ -47,6 +48,7 @@ public class FileHandler {
     private static final String DEFAULT_MOD_AUTHOR = "Unknown";
     private static final String DEFAULT_MOD_ICON = "";
     private static final String DEFAULT_MOD_VERSION = "1.0.0";
+    private static final String FALLBACK_ZIP_FILE_NAME = "imported_mod.zip";
     private static final Gson GSON = new GsonBuilder()
             .setPrettyPrinting()
             .disableHtmlEscaping()
@@ -92,8 +94,8 @@ public class FileHandler {
         List<Uri> fileUris = extractFileUris(intent);
         List<Uri> supportedUris = new ArrayList<>();
         for (Uri uri : fileUris) {
-            String fileName = resolveFileName(uri);
-            if (isSupportedImportFile(fileName)) {
+            String fileName = resolveImportFileName(uri);
+            if (isSupportedImportFile(uri, fileName)) {
                 supportedUris.add(uri);
             }
         }
@@ -102,7 +104,6 @@ public class FileHandler {
             if (isButtonClick) {
                 new CustomAlertDialog(context)
                         .setTitleText(context.getString(R.string.invalid_mod_file))
-                        .setTitleColor(Color.RED)
                         .setMessage(context.getString(R.string.invalid_mod_file_reason))
                         .setUseBorderedBackground(true)
                         .setBlurBackground(true)
@@ -115,9 +116,15 @@ public class FileHandler {
         new Thread(() -> {
             List<Uri> packagedUris = new ArrayList<>();
             List<Uri> bareUris = new ArrayList<>();
+            List<String> invalidZipNames = new ArrayList<>();
             for (Uri uri : supportedUris) {
-                String fileName = resolveFileName(uri);
-                if (needsMetadataInput(uri, fileName)) {
+                String fileName = resolveImportFileName(uri);
+                if (isZipModPackageFile(uri, fileName) && !isValidZipModPackage(uri)) {
+                    invalidZipNames.add(fileName);
+                    continue;
+                }
+
+                if (needsMetadataInput(fileName)) {
                     bareUris.add(uri);
                 } else {
                     packagedUris.add(uri);
@@ -125,53 +132,140 @@ public class FileHandler {
             }
 
             new Handler(Looper.getMainLooper()).post(() -> {
-                if (!packagedUris.isEmpty()) {
-                    new CustomAlertDialog(context)
-                            .setTitleText(context.getString(R.string.import_confirmation_title))
-                            .setMessage(context.getString(R.string.import_confirmation_message, packagedUris.size()))
-                            .setPositiveButton(context.getString(R.string.confirm), d -> handleFilesWithOverwriteCheck(packagedUris, null, null, null, callback))
-                            .setNegativeButton(context.getString(R.string.cancel), d -> {
-                                if (callback != null) {
-                                    callback.onError(context.getString(R.string.user_cancelled));
-                                }
-                            })
-                            .show();
-                }
+                Runnable showImportDialogs = () -> {
+                    if (!packagedUris.isEmpty()) {
+                        new CustomAlertDialog(context)
+                                .setTitleText(context.getString(R.string.import_confirmation_title))
+                                .setMessage(context.getString(R.string.import_confirmation_message, packagedUris.size()))
+                                .setPositiveButton(context.getString(R.string.confirm), d -> handleFilesWithOverwriteCheck(packagedUris, null, null, null, callback))
+                                .setNegativeButton(context.getString(R.string.cancel), d -> {
+                                    if (callback != null) {
+                                        callback.onError(context.getString(R.string.user_cancelled));
+                                    }
+                                })
+                                .show();
+                    }
 
-                if (!bareUris.isEmpty()) {
-                    showNextMetadataDialog(bareUris, 0, callback);
+                    if (!bareUris.isEmpty()) {
+                        showNextMetadataDialog(bareUris, 0, callback);
+                    }
+                };
+
+                if (!invalidZipNames.isEmpty()) {
+                    showInvalidZipPackageDialog(invalidZipNames, showImportDialogs);
+                } else {
+                    showImportDialogs.run();
                 }
             });
         }).start();
     }
 
-    private boolean needsMetadataInput(Uri uri, String fileName) {
+    private boolean needsMetadataInput(String fileName) {
         String lowerName = fileName.toLowerCase(Locale.ROOT);
         if (lowerName.endsWith(".so")) {
             return true;
         }
-        if (lowerName.endsWith(".zip")) {
-            return !peekZipForManifest(uri);
-        }
         return false;
     }
 
-    private boolean peekZipForManifest(Uri uri) {
-        try (InputStream raw = context.getContentResolver().openInputStream(uri);
-             ZipInputStream zis = new ZipInputStream(raw)) {
-            if (raw == null) return false;
-            ZipEntry entry;
-            while ((entry = zis.getNextEntry()) != null) {
-                String name = entry.getName();
-                if (name != null && (name.equals(MANIFEST_FILE_NAME) || name.endsWith("/" + MANIFEST_FILE_NAME))) {
-                    return true;
+    private boolean isZipModPackageFile(String fileName) {
+        if (fileName == null) {
+            return false;
+        }
+
+        String lowerName = fileName.toLowerCase(Locale.ROOT);
+        return lowerName.endsWith(".zip") || lowerName.endsWith(".levipack");
+    }
+
+    private boolean isZipModPackageFile(Uri uri, String fileName) {
+        return isZipModPackageFile(fileName) || isZipMimeType(uri) || hasZipHeader(uri);
+    }
+
+    private void showInvalidZipPackageDialog(List<String> invalidZipNames, Runnable afterDismiss) {
+        StringBuilder message = new StringBuilder(context.getString(R.string.invalid_zip_mod_package_message));
+        if (!invalidZipNames.isEmpty()) {
+            message.append("\n\n");
+            for (String fileName : invalidZipNames) {
+                message.append("- ").append(fileName).append('\n');
+            }
+        }
+
+        new CustomAlertDialog(context)
+                .setTitleText(context.getString(R.string.invalid_zip_mod_package_title))
+                .setMessage(message.toString().trim())
+                .setUseBorderedBackground(true)
+                .setBlurBackground(true)
+                .setPositiveButton(context.getString(R.string.confirm), d -> {
+                    if (afterDismiss != null) {
+                        afterDismiss.run();
+                    }
+                })
+                .show();
+    }
+
+    private boolean isValidZipModPackage(Uri uri) {
+        Set<String> manifestRoots = new HashSet<>();
+        List<String> soEntries = new ArrayList<>();
+
+        try (InputStream raw = context.getContentResolver().openInputStream(uri)) {
+            if (raw == null) {
+                return false;
+            }
+
+            try (ZipInputStream zis = new ZipInputStream(raw)) {
+                ZipEntry entry;
+                while ((entry = zis.getNextEntry()) != null) {
+                    String name = normalizeZipEntryName(entry.getName());
+                    if (name.isEmpty() || isIgnoredZipEntry(name)) {
+                        zis.closeEntry();
+                        continue;
+                    }
+
+                    if (!entry.isDirectory()) {
+                        if (name.equals(MANIFEST_FILE_NAME)) {
+                            manifestRoots.add("");
+                        } else if (name.endsWith("/" + MANIFEST_FILE_NAME)) {
+                            manifestRoots.add(name.substring(0, name.length() - MANIFEST_FILE_NAME.length() - 1));
+                        }
+
+                        if (name.toLowerCase(Locale.ROOT).endsWith(".so")) {
+                            soEntries.add(name);
+                        }
+                    }
+                    zis.closeEntry();
                 }
-                zis.closeEntry();
             }
         } catch (Exception e) {
-            Log.w(TAG, "Could not peek zip for manifest: " + e.getMessage());
+            Log.w(TAG, "Invalid zip mod package", e);
+            return false;
         }
-        return false;
+
+        if (manifestRoots.isEmpty() || soEntries.size() != 1) {
+            return false;
+        }
+        if (manifestRoots.contains("") && isSoUnderRoot("", soEntries.get(0))) {
+            return true;
+        }
+
+        int validRootCount = 0;
+        for (String manifestRoot : manifestRoots) {
+            if (isSoUnderRoot(manifestRoot, soEntries.get(0))) {
+                validRootCount++;
+            }
+        }
+        return validRootCount == 1;
+    }
+
+    private boolean isSoUnderRoot(String root, String soEntry) {
+        if (root == null || root.isEmpty()) {
+            return true;
+        }
+
+        return soEntry != null && soEntry.startsWith(root + "/");
+    }
+
+    private boolean isIgnoredZipEntry(String normalizedName) {
+        return "__MACOSX".equals(normalizedName) || normalizedName.startsWith("__MACOSX/");
     }
 
     private void showNextMetadataDialog(List<Uri> bareUris, int index, FileOperationCallback callback) {
@@ -317,8 +411,8 @@ public class FileHandler {
             for (Uri uri : fileUris) {
                 PreparedImport preparedImport = null;
                 try {
-                    String fileName = resolveFileName(uri);
-                    if (!isSupportedImportFile(fileName)) {
+                    String fileName = resolveImportFileName(uri);
+                    if (!isSupportedImportFile(uri, fileName)) {
                         throw new IOException("Unsupported mod import file: " + fileName);
                     }
 
@@ -368,7 +462,7 @@ public class FileHandler {
         if (lowerName.endsWith(".so")) {
             return prepareSoImport(uri, fileName, overrideName, overrideType, overrideVersion);
         }
-        if (lowerName.endsWith(".zip")) {
+        if (isZipModPackageFile(uri, fileName)) {
             return prepareZipImport(uri, fileName, overrideName, overrideType, overrideVersion);
         }
         throw new IOException("Unsupported mod import file: " + fileName);
@@ -415,6 +509,15 @@ public class FileHandler {
         }
 
         List<String> soFiles = collectRelativeSoFiles(modRoot);
+        if (soFiles.size() != 1) {
+            throw new IOException("Invalid mod zip: exactly one .so entry is required");
+        }
+
+        File manifestFile = new File(modRoot, MANIFEST_FILE_NAME);
+        if (!manifestFile.isFile()) {
+            throw new IOException("Invalid mod zip: manifest.json is required");
+        }
+
         JsonObject manifest = readManifest(modRoot);
         String entryPath = resolveEntryPath(manifest, modRoot, soFiles, fileName);
         if (entryPath == null) {
@@ -428,7 +531,7 @@ public class FileHandler {
                 manifest, displayName, entryPath, modRoot, overrideType, overrideVersion));
 
         String rootName = modRoot.equals(stagingRoot) ? stripExtension(fileName) : modRoot.getName();
-        String targetId = buildTargetId(displayName, rootName);
+        String targetId = buildTargetId(stripExtension(fileName), rootName);
         return new PreparedImport(targetId, modRoot, stagingRoot);
     }
 
@@ -706,7 +809,7 @@ public class FileHandler {
     }
 
     private File findImportedModRoot(File extractedRoot) {
-        if (isDirectModRoot(extractedRoot)) {
+        if (isValidZipModRoot(extractedRoot)) {
             return extractedRoot;
         }
 
@@ -729,7 +832,7 @@ public class FileHandler {
                 continue;
             }
 
-            if (isDirectModRoot(child)) {
+            if (isValidZipModRoot(child)) {
                 candidates.add(child);
                 continue;
             }
@@ -737,14 +840,14 @@ public class FileHandler {
         }
     }
 
-    private boolean isDirectModRoot(File directory) {
+    private boolean isValidZipModRoot(File directory) {
         if (!directory.isDirectory()) {
             return false;
         }
 
         File manifestFile = new File(directory, MANIFEST_FILE_NAME);
-        if (manifestFile.isFile()) {
-            return true;
+        if (!manifestFile.isFile()) {
+            return false;
         }
 
         File[] files = directory.listFiles();
@@ -752,12 +855,25 @@ public class FileHandler {
             return false;
         }
 
+        return countSoFiles(directory) == 1;
+    }
+
+    private int countSoFiles(File directory) {
+        File[] files = directory.listFiles();
+        if (files == null) {
+            return 0;
+        }
+
+        int soCount = 0;
         for (File file : files) {
             if (file.isFile() && file.getName().toLowerCase(Locale.ROOT).endsWith(".so")) {
-                return true;
+                soCount++;
+            }
+            if (file.isDirectory()) {
+                soCount += countSoFiles(file);
             }
         }
-        return false;
+        return soCount;
     }
 
     private boolean confirmOverwrite(String modName) {
@@ -949,13 +1065,13 @@ public class FileHandler {
         new Handler(Looper.getMainLooper()).post(() -> callback.onError(message));
     }
 
-    private boolean isSupportedImportFile(String fileName) {
+    private boolean isSupportedImportFile(Uri uri, String fileName) {
         if (fileName == null) {
             return false;
         }
 
         String lowerName = fileName.toLowerCase(Locale.ROOT);
-        return lowerName.endsWith(".so") || lowerName.endsWith(".zip");
+        return lowerName.endsWith(".so") || isZipModPackageFile(uri, fileName);
     }
 
     private String getStringProperty(JsonObject object, String key) {
@@ -963,6 +1079,65 @@ public class FileHandler {
             return null;
         }
         return object.get(key).getAsString();
+    }
+
+    private String resolveImportFileName(Uri uri) {
+        String fileName = resolveFileName(uri);
+        if (isZipModPackageFile(fileName) || hasSupportedPlainExtension(fileName)) {
+            return fileName;
+        }
+        if (isZipMimeType(uri) || hasZipHeader(uri)) {
+            return FALLBACK_ZIP_FILE_NAME;
+        }
+        return fileName;
+    }
+
+    private boolean hasSupportedPlainExtension(String fileName) {
+        if (fileName == null) {
+            return false;
+        }
+
+        return fileName.toLowerCase(Locale.ROOT).endsWith(".so");
+    }
+
+    private boolean isZipMimeType(Uri uri) {
+        String mimeType;
+        try {
+            mimeType = context.getContentResolver().getType(uri);
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to resolve MIME type", e);
+            return false;
+        }
+        if (mimeType == null) {
+            return false;
+        }
+
+        String lowerMimeType = mimeType.toLowerCase(Locale.ROOT);
+        return "application/zip".equals(lowerMimeType)
+                || "application/x-zip".equals(lowerMimeType)
+                || "application/x-zip-compressed".equals(lowerMimeType);
+    }
+
+    private boolean hasZipHeader(Uri uri) {
+        try (InputStream input = context.getContentResolver().openInputStream(uri)) {
+            if (input == null) {
+                return false;
+            }
+
+            byte[] header = new byte[4];
+            int read = input.read(header);
+            if (read < header.length) {
+                return false;
+            }
+
+            return header[0] == 0x50
+                    && header[1] == 0x4B
+                    && (header[2] == 0x03 || header[2] == 0x05 || header[2] == 0x07)
+                    && (header[3] == 0x04 || header[3] == 0x06 || header[3] == 0x08);
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to inspect zip header", e);
+            return false;
+        }
     }
 
     private List<Uri> extractFileUris(Intent intent) {

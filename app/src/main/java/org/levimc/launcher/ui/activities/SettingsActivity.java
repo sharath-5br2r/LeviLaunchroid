@@ -19,6 +19,7 @@ import android.widget.GridLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.SeekBar;
 import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -29,6 +30,7 @@ import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 
 import org.levimc.launcher.R;
+import org.levimc.launcher.core.crash.CrashReporter;
 import org.levimc.launcher.settings.FeatureSettings;
 import org.levimc.launcher.ui.animation.DynamicAnim;
 import org.levimc.launcher.ui.dialogs.LogcatOverlayManager;
@@ -65,6 +67,8 @@ public class SettingsActivity extends BaseActivity {
     private LinearLayout colorGridContainer;
     private LinearLayout moreColorsContainer;
     private TextView bgImageStatus;
+    private TextView bgImageBlurValue;
+    private TextView bgImageBrightnessValue;
     private ImageView bgImagePreview;
 
     @Override
@@ -114,6 +118,9 @@ public class SettingsActivity extends BaseActivity {
         setupAboutSection();
 
         TextView[] tabs = {tabBasic, tabPersonalize, tabUpdates, tabAbout};
+        if (selectedTabIndex >= tabs.length) {
+            selectedTabIndex = 0;
+        }
         selectTab(tabs[selectedTabIndex]);
     }
 
@@ -184,7 +191,12 @@ public class SettingsActivity extends BaseActivity {
                 getString(R.string.english),
                 getString(R.string.chinese),
                 getString(R.string.russian),
-                getString(R.string.indonesian)
+                getString(R.string.indonesian),
+                getString(R.string.spanish),
+                getString(R.string.portuguese),
+                getString(R.string.french),
+                getString(R.string.japanese),
+                getString(R.string.hindi)
         };
 
         String currentCode = languageManager.getCurrentLanguage();
@@ -192,6 +204,11 @@ public class SettingsActivity extends BaseActivity {
             case "zh", "zh-CN" -> 1;
             case "ru" -> 2;
             case "idn" -> 3;
+            case "es" -> 4;
+            case "pt" -> 5;
+            case "fr" -> 6;
+            case "ja" -> 7;
+            case "hi" -> 8;
             default -> 0;
         };
 
@@ -211,6 +228,11 @@ public class SettingsActivity extends BaseActivity {
                     case 1 -> "zh-CN";
                     case 2 -> "ru";
                     case 3 -> "idn";
+                    case 4 -> "es";
+                    case 5 -> "pt";
+                    case 6 -> "fr";
+                    case 7 -> "ja";
+                    case 8 -> "hi";
                     default -> "en";
                 };
                 if (!code.equals(languageManager.getCurrentLanguage())) {
@@ -232,6 +254,13 @@ public class SettingsActivity extends BaseActivity {
                 LogcatOverlayManager mgr = LogcatOverlayManager.getInstance();
                 if (mgr != null) mgr.refreshVisibility();
             } catch (Throwable ignored) {}
+        });
+
+        SwitchMaterial switchCrashUpload = findViewById(R.id.switch_crash_upload);
+        switchCrashUpload.setChecked(fs.isCrashUploadEnabled());
+        switchCrashUpload.setOnCheckedChangeListener((btn, checked) -> {
+            fs.setCrashUploadEnabled(checked);
+            CrashReporter.refreshCrashlyticsCollection(this);
         });
 
         SwitchMaterial switchManagedLogin = findViewById(R.id.switch_managed_login);
@@ -441,10 +470,18 @@ public class SettingsActivity extends BaseActivity {
             int trackChecked = Color.argb(100, Color.red(accent), Color.green(accent), Color.blue(accent));
             switchManagedLogin.setTrackTintList(new ColorStateList(states, new int[]{trackChecked, 0xFF555555}));
         }
+
+        SwitchMaterial switchCrashUpload = findViewById(R.id.switch_crash_upload);
+        if (switchCrashUpload != null && accent != 0) {
+            int[][] states = {{android.R.attr.state_checked}, {}};
+            switchCrashUpload.setThumbTintList(new ColorStateList(states, new int[]{accent, 0xFFAAAAAA}));
+            int trackChecked = Color.argb(100, Color.red(accent), Color.green(accent), Color.blue(accent));
+            switchCrashUpload.setTrackTintList(new ColorStateList(states, new int[]{trackChecked, 0xFF555555}));
+        }
         
         TextView navAppName = findViewById(R.id.nav_app_name);
         if (navAppName != null && accent != 0) {
-            pm.applySubtleWhiteGradient(navAppName, accent, 0.35f, false);
+            pm.applySolidAccentText(navAppName, accent);
         }
         
         Button navSignInBtn = findViewById(R.id.nav_sign_in_button);
@@ -472,6 +509,7 @@ public class SettingsActivity extends BaseActivity {
 
         if (btnSelectImage == null) return;
 
+        setupBackgroundImageControls();
         updateBgImageUI();
 
         btnSelectImage.setOnClickListener(v -> {
@@ -489,14 +527,101 @@ public class SettingsActivity extends BaseActivity {
         }
     }
 
+    private void setupBackgroundImageControls() {
+        SeekBar blurSeek = findViewById(R.id.seek_bg_image_blur);
+        SeekBar brightnessSeek = findViewById(R.id.seek_bg_image_brightness);
+        bgImageBlurValue = findViewById(R.id.bg_image_blur_value);
+        bgImageBrightnessValue = findViewById(R.id.bg_image_brightness_value);
+
+        if (blurSeek != null) {
+            blurSeek.setMax(PersonalizationManager.BG_BLUR_MAX);
+            blurSeek.setProgress(personalizationManager.getBackgroundImageBlur());
+            updateBgImageBlurValue(blurSeek.getProgress());
+            blurSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                @Override
+                public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                    updateBgImageBlurValue(progress);
+                    if (!fromUser) return;
+                    personalizationManager.setBackgroundImageBlur(progress);
+                    if (personalizationManager.supportsRealtimeBackgroundBlur()) {
+                        refreshBackgroundImageEffects();
+                    }
+                }
+
+                @Override
+                public void onStartTrackingTouch(SeekBar seekBar) {
+                }
+
+                @Override
+                public void onStopTrackingTouch(SeekBar seekBar) {
+                    refreshBackgroundImageEffects();
+                }
+            });
+        }
+
+        if (brightnessSeek != null) {
+            brightnessSeek.setMin(PersonalizationManager.BG_BRIGHTNESS_MIN);
+            brightnessSeek.setMax(PersonalizationManager.BG_BRIGHTNESS_MAX);
+            brightnessSeek.setProgress(personalizationManager.getBackgroundImageBrightness());
+            updateBgImageBrightnessValue(brightnessSeek.getProgress());
+            brightnessSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                @Override
+                public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                    updateBgImageBrightnessValue(progress);
+                    if (!fromUser) return;
+                    personalizationManager.setBackgroundImageBrightness(progress);
+                    refreshBackgroundImageColorEffects();
+                }
+
+                @Override
+                public void onStartTrackingTouch(SeekBar seekBar) {
+                }
+
+                @Override
+                public void onStopTrackingTouch(SeekBar seekBar) {
+                }
+            });
+        }
+    }
+
+    private void updateBgImageBlurValue(int blurRadius) {
+        if (bgImageBlurValue != null) {
+            bgImageBlurValue.setText(getString(R.string.bg_image_blur_value, blurRadius));
+        }
+    }
+
+    private void updateBgImageBrightnessValue(int brightnessPercent) {
+        if (bgImageBrightnessValue != null) {
+            bgImageBrightnessValue.setText(getString(R.string.bg_image_brightness_value, brightnessPercent));
+        }
+    }
+
+    private void refreshBackgroundImageEffects() {
+        personalizationManager.refreshBackgroundEffects(this);
+        if (bgImagePreview != null) {
+            personalizationManager.refreshBackgroundImageView(bgImagePreview);
+        }
+    }
+
+    private void refreshBackgroundImageColorEffects() {
+        personalizationManager.refreshBackgroundColorEffects(this);
+        if (bgImagePreview != null) {
+            personalizationManager.applyBackgroundImageEffects(bgImagePreview);
+        }
+    }
+
     private void updateBgImageUI() {
         if (bgImageStatus == null) return;
-        if (personalizationManager.hasBackgroundImage()) {
+        boolean hasBackgroundImage = personalizationManager.hasBackgroundImage();
+        View effectControls = findViewById(R.id.bg_image_effect_controls);
+        if (effectControls != null) {
+            effectControls.setVisibility(hasBackgroundImage ? View.VISIBLE : View.GONE);
+        }
+
+        if (hasBackgroundImage) {
             bgImageStatus.setText(R.string.bg_image_selected);
             if (bgImagePreview != null) {
-                android.graphics.Bitmap bmp = personalizationManager.loadBackgroundBitmap();
-                if (bmp != null) {
-                    bgImagePreview.setImageBitmap(bmp);
+                if (personalizationManager.applyBackgroundImageToView(bgImagePreview)) {
                     bgImagePreview.setVisibility(View.VISIBLE);
                 }
             }

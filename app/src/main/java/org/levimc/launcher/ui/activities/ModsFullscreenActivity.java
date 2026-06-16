@@ -93,6 +93,11 @@ public class ModsFullscreenActivity extends BaseActivity {
 
     private void setupViews() {
         Button addModButton = findViewById(R.id.add_mod_fullscreen_button);
+        if (!getSharedPreferences("LauncherPrefs", MODE_PRIVATE).getBoolean("game_verified", false)) {
+            addModButton.setVisibility(View.GONE);
+        } else {
+            addModButton.setVisibility(View.VISIBLE);
+        }
         addModButton.setOnClickListener(v -> {
             startFilePicker();
         });
@@ -110,7 +115,7 @@ public class ModsFullscreenActivity extends BaseActivity {
         inbuiltModsHeader = findViewById(R.id.inbuilt_mods_header);
         externalModsHeader = findViewById(R.id.external_mods_header);
     }
-    
+
     private void startFilePicker() {
         Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
@@ -322,6 +327,7 @@ public class ModsFullscreenActivity extends BaseActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        setupViews();
         if (viewModel != null) {
             viewModel.refreshMods();
         }

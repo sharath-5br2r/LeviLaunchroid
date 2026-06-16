@@ -1,7 +1,9 @@
 name: Android CI
 
 on:
-  workflow_dispatch:
+  push:
+    tags:
+      - '*'
 
 jobs:
   build:
@@ -12,6 +14,41 @@ jobs:
         with:
           fetch-depth: 0
           submodules: "recursive"
+
+      - name: Prepare google-services.json
+        run: |
+          mkdir -p app
+          cat > app/google-services.json <<'JSON'
+          {
+            "project_info": {
+              "project_number": "000000000000",
+              "project_id": "ci-placeholder",
+              "storage_bucket": "ci-placeholder.appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:000000000000:android:0000000000000000000000",
+                  "android_client_info": {
+                    "package_name": "org.levimc.launcher"
+                  }
+                },
+                "oauth_client": [],
+                "api_key": [
+                  {
+                    "current_key": "AIzaSyCIOnlyPlaceholderKey"
+                  }
+                ],
+                "services": {
+                  "appinvite_service": {
+                    "other_platform_oauth_client": []
+                  }
+                }
+              }
+            ],
+            "configuration_version": "1"
+          }
+          JSON
 
       - name: Setup Java JDK
         uses: actions/setup-java@v4
@@ -27,9 +64,6 @@ jobs:
 
       - name: Install Build Tools 35.0.0
         run: sdkmanager "build-tools;35.0.0"
-
-      - name: Verify installed SDK Packages
-        run: sdkmanager --list
 
       - name: Setup Xmake
         uses: xmake-io/github-action-setup-xmake@v1
@@ -52,34 +86,38 @@ jobs:
           CF_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
         run: echo "curseforge.api_key=${CF_API_KEY}" >> local.properties
 
-      - name: Build Unsigned Release APK
+      - name: Build Release APK
         run: ./gradlew assembleRelease
 
-
-      - name: Sign Release APK
-        uses: kevin-david/zipalign-sign-android-release@v2
-        id: sign_app
-        with:
-          releaseDirectory: app/build/outputs/apk/release
-          signingKeyBase64: ${{ secrets.SIGNING_KEY_STORE }}
-          alias: ${{ secrets.SIGNING_KEY_ALIAS }}
-          keyStorePassword: ${{ secrets.SIGNING_STORE_PASSWORD }}
-          keyPassword: ${{ secrets.SIGNING_KEY_PASSWORD }}
-          zipAlign: true
-        env:
-          BUILD_TOOLS_VERSION: "35.0.0"
-
-      - name: Rename APK with tag
+      - name: Download Android testkey
         run: |
-          SIGNED_APK="${{ steps.sign_app.outputs.signedReleaseFile }}"
-          APK_DST="LeviLauncher-release.apk"
-          cp "$SIGNED_APK" "$APK_DST"
-          echo "Signed APK renamed to $APK_DST"
-          
-      - name: Release APK to GitHub Releases
-        uses: softprops/action-gh-release@v3
+          wget -q -O testkey.pk8 "https://raw.githubusercontent.com/aosp-mirror/platform_build/master/target/product/security/testkey.pk8"
+          wget -q -O testkey.x509.pem "https://raw.githubusercontent.com/aosp-mirror/platform_build/master/target/product/security/testkey.x509.pem"
+
+      - name: Install apksigner
+        run: sudo apt-get install -y apksigner
+
+      - name: Sign APK with testkey
+        run: |
+          APK_IN=$(find app/build/outputs/apk/release -name "*.apk" | head -1)
+          APK_OUT="LeviLauncher-${GITHUB_REF_NAME}-release.apk"
+          apksigner sign \
+            --key testkey.pk8 \
+            --cert testkey.x509.pem \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --v4-signing-enabled true \
+            --out "$APK_OUT" \
+            "$APK_IN"
+          echo "APK_OUT=$APK_OUT" >> $GITHUB_ENV
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          repository: sharath-5br2r/patched-apks-builder
-          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
-          files: LeviLauncher-release.apk
-          tag_name: all
+          tag_name: ${{ github.ref_name }}
+          name: "LeviLauncher Unlocked ${{ github.ref_name }}"
+          files: ${{ env.APK_OUT }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

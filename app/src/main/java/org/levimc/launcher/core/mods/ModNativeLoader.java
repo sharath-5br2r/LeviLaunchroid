@@ -5,37 +5,83 @@ import android.util.Log;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.HashSet;
 import java.util.List;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Set;
 
 public class ModNativeLoader {
     private static final String TAG = "ModNativeLoader";
+    private static final int CACHE_MANIFEST_VERSION = 2;
 
     public static void loadEnabledSoMods(ModManager modManager, File cacheDir) {
+        loadEnabledSoMods(modManager, cacheDir, null);
+    }
+
+    public interface LoadListener {
+        void onScanStarted(int totalEnabled);
+        void onModLoadStarted(Mod mod, int index, int total);
+        void onModLoadFinished(Mod mod);
+        void onModLoadSkipped(Mod mod, String minecraftVersion);
+        void onModLoadFailed(Mod mod, Throwable error);
+        void onMessage(String message);
+    }
+
+    public static void loadEnabledSoMods(ModManager modManager, File cacheDir, LoadListener listener) {
         if (modManager.getCurrentVersion() == null || modManager.getCurrentVersion().modsDir == null) {
+            notifyMessage(listener, "Native mod directory is not configured");
             return;
         }
 
         List<Mod> mods = modManager.getMods();
+        String minecraftVersion = modManager.getCurrentVersion().versionCode;
+        int totalEnabled = 0;
+        for (Mod mod : mods) {
+            if (mod.isEnabled()) {
+                totalEnabled++;
+            }
+        }
+        if (listener != null) {
+            listener.onScanStarted(totalEnabled);
+        }
+
         File cacheModsDir = new File(cacheDir, "mods");
         if (!cacheModsDir.exists() && !cacheModsDir.mkdirs()) {
             Log.e(TAG, "Failed to create cache mod directory: " + cacheModsDir.getAbsolutePath());
+            notifyMessage(listener, "Failed to create cache mod directory: " + cacheModsDir.getAbsolutePath());
             return;
         }
 
         Set<String> stagedModIds = new HashSet<>();
+        int currentIndex = 0;
         for (Mod mod : mods) {
             if (!mod.isEnabled()) {
                 continue;
             }
+            currentIndex++;
+            if (listener != null) {
+                listener.onModLoadStarted(mod, currentIndex, totalEnabled);
+            }
+
+            if (!isCompatibleWithMinecraftVersion(mod, minecraftVersion)) {
+                Log.w(TAG, "Skipping incompatible mod " + mod.getDisplayName()
+                        + " for Minecraft " + minecraftVersion);
+                notifySkipped(listener, mod, minecraftVersion);
+                continue;
+            }
 
             try {
-                File targetFile = prepareCachedEntry(modManager, cacheModsDir, mod);
+                File targetFile = prepareCachedEntry(modManager, cacheModsDir, mod, listener);
                 if (targetFile == null || !targetFile.isFile()) {
-                    Log.e(TAG, "Entry not found after copy: " + (targetFile == null ? "<null>" : targetFile.getAbsolutePath()));
+                    IOException error = new IOException("Entry not found after copy: " + (targetFile == null ? "<null>" : targetFile.getAbsolutePath()));
+                    Log.e(TAG, error.getMessage());
+                    notifyFailure(listener, mod, error);
                     continue;
                 }
 
@@ -46,31 +92,191 @@ public class ModNativeLoader {
                 if (ModManager.ensurePreloaderLoaded()) {
                     if (!ModManager.initializeLoadedMod(targetFile.getAbsolutePath(), mod)) {
                         Log.e(TAG, "Failed to finish native initialization for " + mod.getDisplayName());
+                        notifyFailure(listener, mod, new UnsatisfiedLinkError("Failed to finish native initialization"));
                         continue;
                     }
                 }
+                if (listener != null) {
+                    listener.onModLoadFinished(mod);
+                }
             } catch (IOException | UnsatisfiedLinkError e) {
                 Log.e(TAG, "Can't load " + mod.getDisplayName() + ": " + e.getMessage(), e);
+                notifyFailure(listener, mod, e);
             }
         }
 
         pruneStaleCachedMods(cacheModsDir, stagedModIds);
     }
 
-    private static File prepareCachedEntry(ModManager modManager, File cacheModsDir, Mod mod) throws IOException {
+    public static boolean isCompatibleWithMinecraftVersion(Mod mod, String minecraftVersion) {
+        if (mod == null) {
+            return true;
+        }
+        return isCompatibleWithMinecraftVersion(mod.getMinecraftVersions(), minecraftVersion);
+    }
+
+    public static boolean isCompatibleWithMinecraftVersion(List<String> patterns, String minecraftVersion) {
+        if (patterns == null || patterns.isEmpty()) {
+            return true;
+        }
+
+        boolean hasValidPattern = false;
+        for (String pattern : patterns) {
+            if (pattern == null) {
+                continue;
+            }
+
+            String normalizedPattern = pattern.trim();
+            if (normalizedPattern.isEmpty()) {
+                continue;
+            }
+
+            hasValidPattern = true;
+            if (matchesMinecraftVersionPattern(normalizedPattern, minecraftVersion)) {
+                return true;
+            }
+        }
+        return !hasValidPattern;
+    }
+
+    public static boolean matchesMinecraftVersionPattern(String pattern, String minecraftVersion) {
+        if (pattern == null || minecraftVersion == null) {
+            return false;
+        }
+
+        String normalizedPattern = pattern.trim();
+        String normalizedVersion = minecraftVersion.trim();
+        if (normalizedPattern.isEmpty() || normalizedVersion.isEmpty()) {
+            return false;
+        }
+
+        int wildcardIndex = normalizedPattern.indexOf('*');
+        if (wildcardIndex < 0) {
+            return normalizedVersion.equals(normalizedPattern);
+        }
+
+        String prefix = normalizedPattern.substring(0, wildcardIndex);
+        return normalizedVersion.startsWith(prefix);
+    }
+
+    private static void notifySkipped(LoadListener listener, Mod mod, String minecraftVersion) {
+        if (listener != null) {
+            listener.onModLoadSkipped(mod, minecraftVersion);
+        }
+    }
+
+    private static void notifyFailure(LoadListener listener, Mod mod, Throwable error) {
+        if (listener != null) {
+            listener.onModLoadFailed(mod, error);
+        }
+    }
+
+    private static void notifyMessage(LoadListener listener, String message) {
+        if (listener != null) {
+            listener.onMessage(message);
+        }
+    }
+
+    private static File prepareCachedEntry(ModManager modManager, File cacheModsDir, Mod mod, LoadListener listener) throws IOException {
         File sourceDirectory = new File(modManager.getCurrentVersion().modsDir, mod.getId());
         if (!sourceDirectory.isDirectory()) {
             throw new IOException("Mod package directory does not exist: " + sourceDirectory.getAbsolutePath());
         }
 
         File targetDirectory = new File(cacheModsDir, mod.getId());
+        String sourceFingerprint = buildManifest(sourceDirectory, mod);
+        File manifestFile = new File(targetDirectory, ".mod_cache_manifest");
+        if (targetDirectory.isDirectory() && manifestFile.isFile()) {
+            String cached = readFile(manifestFile);
+            File targetFile = new File(targetDirectory, mod.getEntryPath());
+            if (sourceFingerprint.equals(cached) && targetFile.isFile() && targetFile.length() > 0) {
+                ensureReadOnly(targetFile);
+                return targetFile;
+            }
+        }
+
+        File tempDirectory = new File(cacheModsDir, mod.getId() + ".tmp");
+        if (tempDirectory.exists() && !deleteRecursively(tempDirectory)) {
+            throw new IOException("Failed to clear temporary mod directory: " + tempDirectory.getAbsolutePath());
+        }
+        copyDirectory(sourceDirectory, tempDirectory);
+        writeManifest(new File(tempDirectory, ".mod_cache_manifest"), sourceFingerprint);
+
         if (targetDirectory.exists() && !deleteRecursively(targetDirectory)) {
+            deleteRecursively(tempDirectory);
             throw new IOException("Failed to clear cached mod directory: " + targetDirectory.getAbsolutePath());
         }
-        copyDirectory(sourceDirectory, targetDirectory);
+        if (!tempDirectory.renameTo(targetDirectory)) {
+            deleteRecursively(tempDirectory);
+            throw new IOException("Failed to promote cached mod directory: " + targetDirectory.getAbsolutePath());
+        }
+
         File targetFile = new File(targetDirectory, mod.getEntryPath());
         ensureReadOnly(targetFile);
         return targetFile;
+    }
+
+    private static String readFile(File file) {
+        try {
+            return new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            return "";
+        }
+    }
+
+    private static void writeManifest(File file, String data) throws IOException {
+        ensureParentDirectory(file);
+        try (FileWriter writer = new FileWriter(file)) {
+            writer.write(data);
+        }
+    }
+
+    private static String buildManifest(File sourceDirectory, Mod mod) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        sb.append("loader=").append(CACHE_MANIFEST_VERSION).append('\n');
+        sb.append("id=").append(mod.getId()).append('\n');
+        sb.append("entry=").append(mod.getEntryPath()).append('\n');
+
+        List<File> files = new ArrayList<>();
+        collectFiles(sourceDirectory, files);
+        files.sort(Comparator.comparing(file -> relativePath(sourceDirectory, file)));
+        for (File file : files) {
+            sb.append("file=")
+                    .append(relativePath(sourceDirectory, file))
+                    .append('|')
+                    .append(file.length())
+                    .append('|')
+                    .append(file.lastModified())
+                    .append('\n');
+        }
+        return sb.toString();
+    }
+
+    private static void collectFiles(File root, List<File> files) throws IOException {
+        File[] children = root.listFiles();
+        if (children == null) {
+            throw new IOException("Failed to list mod directory: " + root.getAbsolutePath());
+        }
+
+        for (File child : children) {
+            if (child.isDirectory()) {
+                collectFiles(child, files);
+            } else if (child.isFile()) {
+                files.add(child);
+            }
+        }
+    }
+
+    private static String relativePath(File root, File file) {
+        String rootPath = root.getAbsolutePath();
+        String filePath = file.getAbsolutePath();
+        String relative = filePath.startsWith(rootPath)
+                ? filePath.substring(rootPath.length())
+                : file.getName();
+        while (relative.startsWith(File.separator)) {
+            relative = relative.substring(1);
+        }
+        return relative.replace(File.separatorChar, '/');
     }
 
     private static void copyFile(File src, File dst) throws IOException {
@@ -148,6 +354,10 @@ public class ModNativeLoader {
 
         for (File cachedEntry : cachedEntries) {
             if (stagedModIds.contains(cachedEntry.getName())) {
+                continue;
+            }
+            if (cachedEntry.getName().endsWith(".tmp")) {
+                deleteRecursively(cachedEntry);
                 continue;
             }
 

@@ -2,67 +2,57 @@ package org.levimc.launcher.core.minecraft
 
 import android.content.Intent
 import android.content.res.AssetManager
+import android.graphics.Color
 import android.os.Bundle
 import android.view.KeyEvent
 import android.view.MotionEvent
-import android.widget.Toast
 import com.mojang.minecraftpe.MainActivity
+import org.levimc.launcher.core.crash.CrashReporter
 import org.levimc.launcher.core.mods.inbuilt.overlay.InbuiltOverlayManager
-import org.levimc.launcher.core.versions.GameVersion
-import org.levimc.launcher.settings.FeatureSettings
 import java.io.File
 
 class MinecraftActivity : MainActivity() {
 
     private lateinit var gameManager: GamePackageManager
+    private lateinit var trace: LaunchTrace
     private var overlayManager: InbuiltOverlayManager? = null
+    private var normalExitPrepared = false
+    private var normalExitRestartScheduled = false
+    private var gameRuntimeStarted = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        try {
-            val versionDir = intent.getStringExtra("MC_PATH")
-            val versionCode = intent.getStringExtra("MINECRAFT_VERSION") ?: ""
-            val versionDirName = intent.getStringExtra("MINECRAFT_VERSION_DIR") ?: ""
-            val isInstalled = intent.getBooleanExtra("IS_INSTALLED", false)
+        trace = LaunchTrace.ensure(intent)
+        trace.mark("MinecraftActivity onCreate entered")
+        window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(resolveLaunchBackgroundColor()))
 
-            val version = if (!versionDir.isNullOrEmpty()) {
-                GameVersion(
-                    versionDirName,
-                    versionCode,
-                    versionCode,
-                    File(versionDir),
-                    isInstalled,
-                    MinecraftLauncher.MC_PACKAGE_NAME,
-                    ""
-                )
-            } else if (!versionCode.isNullOrEmpty()) {
-                GameVersion(
-                    versionDirName,
-                    versionCode,
-                    versionCode,
-                    null,
-                    isInstalled,
-                    MinecraftLauncher.MC_PACKAGE_NAME,
-                    ""
-                )
-            } else {
-                null
-            }
-
-            gameManager = GamePackageManager.getInstance(applicationContext, version)
-
-            try {
-                System.loadLibrary("preloader")
-            } catch (e: Exception) {}
-
-            if (!gameManager.loadLibrary("minecraftpe")) {
-                throw RuntimeException("Failed to load libminecraftpe.so")
-            }
-        } catch (e: Exception) {
-            Toast.makeText(this, "Failed to load game: ${e.message}", Toast.LENGTH_LONG).show()
+        if (savedInstanceState != null) {
+            trace.mark("MinecraftActivity finishing restored instance")
+            gameRuntimeStarted = true
+            super.onCreate(null)
             finish()
             return
         }
-        super.onCreate(savedInstanceState)
+
+        try {
+            val preparedRuntime = MinecraftLaunchSession.getPreparedRuntime()
+                ?: MinecraftRuntimePreparer.prepare(applicationContext, intent)
+            gameManager = preparedRuntime.gameManager
+            trace.mark("Prepared runtime consumed")
+        } catch (throwable: Throwable) {
+            trace.error("MinecraftActivity prepare failed", formatLaunchFailure(throwable))
+            returnToLauncherAfterLaunchFailure()
+            return
+        }
+        trace.mark("Mojang MainActivity super.onCreate starting")
+        try {
+            gameRuntimeStarted = true
+            super.onCreate(savedInstanceState)
+        } catch (throwable: Throwable) {
+            trace.error("Mojang MainActivity super.onCreate failed", formatLaunchFailure(throwable))
+            returnToLauncherAfterLaunchFailure()
+            return
+        }
+        trace.mark("Mojang MainActivity super.onCreate finished")
         
         val launchVertically = intent.getBooleanExtra("LAUNCH_VERTICALLY", false)
         if (launchVertically) {
@@ -71,6 +61,31 @@ class MinecraftActivity : MainActivity() {
         
         org.levimc.launcher.preloader.PreloaderInput.setActivity(this)
         MinecraftActivityState.onCreated(this)
+        getSharedPreferences("LauncherPrefs", MODE_PRIVATE)
+            .edit()
+            .putBoolean("game_verified", true)
+            .apply()
+        trace.mark("MinecraftActivity onCreate finished")
+    }
+
+    private fun returnToLauncherAfterLaunchFailure() {
+        gameRuntimeStarted = false
+        MinecraftLaunchSession.clear()
+        MinecraftProcessRestarter.restartLauncherAfterMinecraftExit(this)
+        finish()
+    }
+
+    private fun formatLaunchFailure(throwable: Throwable): String {
+        return throwable.message ?: throwable.javaClass.simpleName
+    }
+
+    private fun resolveLaunchBackgroundColor(): Int {
+        val typedValue = android.util.TypedValue()
+        return if (theme.resolveAttribute(android.R.attr.colorBackground, typedValue, true)) {
+            typedValue.data
+        } else {
+            Color.BLACK
+        }
     }
 
     private fun startInbuiltModServices() {
@@ -84,12 +99,17 @@ class MinecraftActivity : MainActivity() {
     }
 
     override fun onNewIntent(intent: Intent) {
+        setIntent(intent)
         super.onNewIntent(intent)
     }
 
     override fun onResume() {
         super.onResume()
-        MinecraftActivityState.onResumed()
+        if (!isFinishing) {
+            normalExitPrepared = false
+            normalExitRestartScheduled = false
+        }
+        MinecraftActivityState.onResumed(this)
 
         if (overlayManager == null) {
             startInbuiltModServices()
@@ -97,14 +117,15 @@ class MinecraftActivity : MainActivity() {
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (event.action == KeyEvent.ACTION_DOWN) {
-            val unicodeChar = event.unicodeChar
-            if (unicodeChar != 0) {
-                if (org.levimc.launcher.preloader.PreloaderInput.onKeyChar(unicodeChar)) {
-                    return true
-                }
+        val unicodeChar = event.unicodeChar
+        if (event.action == KeyEvent.ACTION_UP) {
+            if (org.levimc.launcher.preloader.PreloaderInput.onKeyEvent(event.keyCode, unicodeChar, false)) {
+                return true
             }
-            if (org.levimc.launcher.preloader.PreloaderInput.onKeyDown(event.keyCode)) {
+        }
+
+        if (event.action == KeyEvent.ACTION_DOWN) {
+            if (org.levimc.launcher.preloader.PreloaderInput.onKeyEvent(event.keyCode, unicodeChar, true)) {
                 return true
             }
         }
@@ -166,24 +187,49 @@ class MinecraftActivity : MainActivity() {
     }
 
     override fun onPause() {
-        MinecraftActivityState.onPaused()
+        val shouldRestartAfterNormalExit = shouldRestartAfterNormalExit()
+        if (shouldRestartAfterNormalExit) {
+            prepareNormalExitCleanup()
+            scheduleNormalExitProcessRestart()
+        }
+        MinecraftActivityState.onPaused(this)
         super.onPause()
     }
 
     override fun onDestroy() {
-        org.levimc.launcher.preloader.PreloaderInput.clearActivity()
-        MinecraftActivityState.onDestroyed()
-        stopInbuiltModServices()
-        super.onDestroy()
-
-        if (isFinishing) {
-            val intent = Intent(applicationContext, org.levimc.launcher.ui.activities.MainActivity::class.java)
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
-            startActivity(intent)
-
-            finishAndRemoveTask()
-            android.os.Process.killProcess(android.os.Process.myPid())
+        val shouldPrepareNormalExit = shouldRestartAfterNormalExit()
+        if (shouldPrepareNormalExit) {
+            prepareNormalExitCleanup()
         }
+
+        org.levimc.launcher.preloader.PreloaderInput.clearActivity()
+        MinecraftActivityState.onDestroyed(this)
+        MinecraftLaunchSession.clear()
+        stopInbuiltModServices()
+
+        try {
+            super.onDestroy()
+        } finally {
+            if (shouldPrepareNormalExit) {
+                scheduleNormalExitProcessRestart()
+            }
+        }
+    }
+
+    private fun shouldRestartAfterNormalExit(): Boolean {
+        return gameRuntimeStarted && isFinishing && !CrashReporter.isHandlingCrash()
+    }
+
+    private fun prepareNormalExitCleanup() {
+        if (normalExitPrepared) return
+        normalExitPrepared = true
+    }
+
+    private fun scheduleNormalExitProcessRestart() {
+        if (normalExitRestartScheduled) return
+        normalExitRestartScheduled = true
+
+        MinecraftProcessRestarter.restartLauncherAfterMinecraftExit(this)
     }
 
     override fun getAssets(): AssetManager {

@@ -3,10 +3,14 @@ package org.levimc.launcher.ui.activities;
 import android.annotation.SuppressLint;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.res.ColorStateList;
+import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
 import android.text.TextUtils;
 import android.view.View;
+import android.widget.ImageView;
 import android.widget.TextView;
 
 import androidx.activity.OnBackPressedCallback;
@@ -20,6 +24,8 @@ import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.lifecycle.ViewModelProvider;
 
 import org.levimc.launcher.R;
+import org.levimc.launcher.core.minecraft.MinecraftImportIntents;
+import org.levimc.launcher.core.minecraft.LaunchTrace;
 import org.levimc.launcher.core.minecraft.MinecraftLauncher;
 import org.levimc.launcher.core.mods.FileHandler;
 import org.levimc.launcher.core.mods.Mod;
@@ -38,6 +44,7 @@ import org.levimc.launcher.util.ApkImportManager;
 import org.levimc.launcher.util.GithubReleaseUpdater;
 import org.levimc.launcher.util.LanguageManager;
 import org.levimc.launcher.util.PermissionsHandler;
+import org.levimc.launcher.util.PersonalizationManager;
 import org.levimc.launcher.util.PlayStoreValidator;
 import org.levimc.launcher.util.ResourcepackHandler;
 import org.levimc.launcher.util.UIHelper;
@@ -57,6 +64,7 @@ import java.util.concurrent.Executors;
  import android.graphics.drawable.ColorDrawable;
  import android.util.TypedValue;
  import android.view.ViewGroup;
+ import android.view.ViewTreeObserver;
  import androidx.core.content.ContextCompat;
 
 import coelho.msftauth.api.oauth20.OAuth20Token;
@@ -69,6 +77,9 @@ import okhttp3.OkHttpClient;
  import org.levimc.launcher.ui.dialogs.LoadingDialog;
  import org.levimc.launcher.util.AccountTextUtils;
  import org.levimc.launcher.util.DialogUtils;
+
+ import static org.levimc.launcher.core.minecraft.MinecraftProcessRestarterKt.ACTION_MAIN_ACTIVITY_FIRST_DRAWN;
+ import static org.levimc.launcher.core.minecraft.MinecraftProcessRestarterKt.EXTRA_CLOSE_RESTART_ACTIVITY_ON_FIRST_DRAW;
 
  public class MainActivity extends BaseActivity {
     private ActivityMainBinding binding;
@@ -105,12 +116,15 @@ import okhttp3.OkHttpClient;
         super.onCreate(savedInstanceState);
         binding = ActivityMainBinding.inflate(getLayoutInflater());
         setContentView(binding.getRoot());
+        closeLauncherRestartAfterFirstDraw();
         setupNavBar();
         setupManagersAndHandlers();
         setTextMinecraftVersion();
         updateViewModelVersion();
-        checkResourcepack();
-        handleIncomingFiles();
+        if (!forwardIncomingMinecraftResourceToRunningGame()) {
+            checkResourcepack();
+            handleIncomingFiles();
+        }
         new GithubReleaseUpdater(this, "LiteLDev", "LeviLaunchroid", permissionResultLauncher).checkUpdateOnLaunch();
         repairNeededVersions();
         requestBasicPermissions();
@@ -161,6 +175,42 @@ import okhttp3.OkHttpClient;
         });
 
         initAccountHeader();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (forwardIncomingMinecraftResourceToRunningGame()) {
+            return;
+        }
+        checkResourcepack();
+        handleIncomingFiles();
+        handleMinecraftUriLaunch();
+    }
+
+    private void closeLauncherRestartAfterFirstDraw() {
+        Intent intent = getIntent();
+        if (intent == null || !intent.getBooleanExtra(EXTRA_CLOSE_RESTART_ACTIVITY_ON_FIRST_DRAW, false)) {
+            return;
+        }
+        intent.removeExtra(EXTRA_CLOSE_RESTART_ACTIVITY_ON_FIRST_DRAW);
+        setIntent(intent);
+
+        final View root = binding.getRoot();
+        root.getViewTreeObserver().addOnPreDrawListener(new ViewTreeObserver.OnPreDrawListener() {
+            @Override
+            public boolean onPreDraw() {
+                if (root.getViewTreeObserver().isAlive()) {
+                    root.getViewTreeObserver().removeOnPreDrawListener(this);
+                }
+                root.post(() -> {
+                    hideSystemUI();
+                    sendBroadcast(new Intent(ACTION_MAIN_ACTIVITY_FIRST_DRAWN).setPackage(getPackageName()));
+                });
+                return true;
+            }
+        });
     }
 
 
@@ -234,6 +284,22 @@ import okhttp3.OkHttpClient;
             lastAvatarXuid = null;
             return;
         }
+
+        Object currentUrl = accountAvatar.getTag(R.id.nav_account_avatar);
+        if (url.equals(currentUrl) && accountAvatar.getDrawable() != null) {
+            if (avatarProgress != null) avatarProgress.setVisibility(View.GONE);
+            return;
+        }
+
+        Bitmap cached = AccountTextUtils.getCachedAvatar(url);
+        if (cached != null) {
+            accountAvatar.setTag(R.id.nav_account_avatar, url);
+            accountAvatar.setImageBitmap(cached);
+            if (avatarProgress != null) avatarProgress.setVisibility(View.GONE);
+            return;
+        }
+
+        accountAvatar.setTag(R.id.nav_account_avatar, url);
         accountAvatar.setImageDrawable(null);
         if (avatarProgress != null) avatarProgress.setVisibility(View.VISIBLE);
         accountExecutor.execute(() -> {
@@ -241,7 +307,9 @@ import okhttp3.OkHttpClient;
                 try (Response imgResp = avatarClient.newCall(new Request.Builder().url(url).build()).execute()) {
                     Bitmap bmp = (imgResp.isSuccessful() && imgResp.body() != null) ? android.graphics.BitmapFactory.decodeStream(imgResp.body().byteStream()) : null;
                     runOnUiThread(() -> {
+                        if (!url.equals(accountAvatar.getTag(R.id.nav_account_avatar))) return;
                         if (bmp != null) {
+                            AccountTextUtils.cacheAvatar(url, bmp);
                             accountAvatar.setImageBitmap(bmp);
                         }
                         if (avatarProgress != null) avatarProgress.setVisibility(View.GONE);
@@ -498,7 +566,7 @@ import okhttp3.OkHttpClient;
             binding.manageModsButton.setBackground(gd);
 
             if (binding.minecraftTitleText != null) {
-                pm.applySubtleWhiteGradient(binding.minecraftTitleText, accent, 0.35f, true);
+                pm.applySolidAccentText(binding.minecraftTitleText, accent);
             }
         }
 
@@ -520,10 +588,9 @@ import okhttp3.OkHttpClient;
     }
 
     private void repairNeededVersions() {
-        for (GameVersion version : versionManager.getCustomVersions()) {
-            if (version.needsRepair) {
-                VersionManager.attemptRepairLibs(this, version);
-            }
+        GameVersion selectedVersion = versionManager != null ? versionManager.getSelectedVersion() : null;
+        if (selectedVersion != null && selectedVersion.needsRepair) {
+            VersionManager.attemptRepairLibs(this, selectedVersion);
         }
     }
 
@@ -575,6 +642,9 @@ import okhttp3.OkHttpClient;
         refreshAccountHeaderUI();
         viewModel.refreshMods();
         refreshContentCounts();
+        if (binding != null) {
+            binding.launchButton.setEnabled(true);
+        }
     }
 
 
@@ -726,10 +796,13 @@ import okhttp3.OkHttpClient;
     }
     private void performActualLaunch() {
         binding.launchButton.setEnabled(false);
+        LaunchTrace trace = LaunchTrace.create(null);
+        trace.milestone("Launch requested");
 
         GameVersion version = versionManager != null ? versionManager.getSelectedVersion() : null;
 
         if (version == null) {
+            trace.warning("Launch cancelled", "No version selected");
             binding.launchButton.setEnabled(true);
             new CustomAlertDialog(this)
                     .setTitleText(getString(R.string.dialog_title_no_version))
@@ -740,9 +813,11 @@ import okhttp3.OkHttpClient;
         }
 
         if (FeatureSettings.getInstance().isLauncherManagedMcLoginEnabled()) {
+            trace.mark("Checking launcher-managed login");
             MsftAccountStore.MsftAccount active = getActiveAccount();
             boolean loggedIn = active != null && active.minecraftUsername != null && !active.minecraftUsername.isEmpty();
             if (!loggedIn) {
+                trace.warning("Launch cancelled", "Minecraft account is missing");
                 binding.launchButton.setEnabled(true);
                 new CustomAlertDialog(this)
                         .setTitleText(getString(R.string.dialog_title_login_required))
@@ -757,6 +832,7 @@ import okhttp3.OkHttpClient;
         }
 
         if (!version.isInstalled && !version.versionIsolation) {
+            trace.warning("Launch cancelled", "Version isolation must be enabled");
             binding.launchButton.setEnabled(true);
             new CustomAlertDialog(this)
                     .setTitleText(getString(R.string.dialog_title_version_isolation))
@@ -771,28 +847,55 @@ import okhttp3.OkHttpClient;
         }
 
         if (!PlayStoreValidator.isMinecraftFromPlayStore(this)) {
+            trace.warning("Launch cancelled", "Minecraft is not verified as Play Store install");
             binding.launchButton.setEnabled(true);
             PlayStoreValidationDialog.showNotFromPlayStoreDialog(this);
             return;
         }
 
-        new Thread(() -> {
-            try {
-                minecraftLauncher.launch(getIntent(), version);
-                runOnUiThread(() -> {
-                    binding.launchButton.setEnabled(true);
-                });
-            } catch (Exception e) {
-                runOnUiThread(() -> {
-                    binding.launchButton.setEnabled(true);
-                    new CustomAlertDialog(this)
-                            .setTitleText(getString(R.string.dialog_title_launch_failed))
-                            .setMessage(getString(R.string.dialog_message_launch_failed, e.getMessage()))
-                            .setPositiveButton(getString(R.string.dialog_positive_ok), null)
-                            .show();
-                });
-            }
-        }).start();
+        trace.mark("Launch validation completed", version.directoryName + " " + version.versionCode);
+        try {
+            Intent launchIntent = createMinecraftLaunchIntent();
+            launchIntent.putExtra(LaunchTrace.EXTRA_SESSION_ID, trace.getSessionId());
+            launchIntent.putExtra(LaunchTrace.EXTRA_STARTED_ELAPSED_MS,
+                    android.os.SystemClock.elapsedRealtime() - trace.elapsedMs());
+            minecraftLauncher.launch(launchIntent, version, new MinecraftLauncher.LaunchCallback() {
+                @Override
+                public void onLaunchStarted() {
+                    trace.milestone("Loading screen requested");
+                }
+
+                @Override
+                public void onLaunchFailed(Exception e) {
+                    trace.error("Launch failed before loading screen", e.getMessage());
+                    runOnUiThread(() -> {
+                        if (binding != null) binding.launchButton.setEnabled(true);
+                    });
+                }
+            });
+        } catch (Exception e) {
+            trace.error("Launch failed before activity start", e.getMessage());
+            binding.launchButton.setEnabled(true);
+            new CustomAlertDialog(this)
+                    .setTitleText(getString(R.string.dialog_title_launch_failed))
+                    .setMessage(getString(R.string.dialog_message_launch_failed, e.getMessage()))
+                    .setPositiveButton(getString(R.string.dialog_positive_ok), null)
+                    .show();
+        }
+    }
+
+    private Intent createMinecraftLaunchIntent() {
+        Intent launchIntent = new Intent();
+        Intent sourceIntent = getIntent();
+        if (sourceIntent == null) return launchIntent;
+
+        if (sourceIntent.hasExtra("MINECRAFT_URI")) {
+            launchIntent.putExtra("MINECRAFT_URI", sourceIntent.getStringExtra("MINECRAFT_URI"));
+        }
+        if (sourceIntent.hasExtra("MINECRAFT_URI_ACTION")) {
+            launchIntent.putExtra("MINECRAFT_URI_ACTION", sourceIntent.getStringExtra("MINECRAFT_URI_ACTION"));
+        }
+        return launchIntent;
     }
 
      private void showVersionSelectDialog() {
@@ -806,6 +909,7 @@ import okhttp3.OkHttpClient;
         if (custom != null) allVersions.addAll(custom);
 
         View popupView = LayoutInflater.from(this).inflate(R.layout.popup_instance_selector, null);
+        new PersonalizationManager(this).applyAccentToView(popupView, this);
         PopupWindow popup = new PopupWindow(popupView,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -870,7 +974,7 @@ import okhttp3.OkHttpClient;
                 String q = query.toLowerCase();
                 filteredVersions = new ArrayList<>();
                 for (GameVersion v : allVersions) {
-                    String name = v.displayName != null ? v.displayName.toLowerCase() : "";
+                    String name = getInstanceDisplayName(v).toLowerCase();
                     String code = v.versionCode != null ? v.versionCode.toLowerCase() : "";
                     String dir = v.directoryName != null ? v.directoryName.toLowerCase() : "";
                     if (name.contains(q) || code.contains(q) || dir.contains(q)) {
@@ -894,22 +998,48 @@ import okhttp3.OkHttpClient;
                     && selectedVersion.directoryName != null
                     && selectedVersion.directoryName.equals(v.directoryName);
 
-            holder.name.setText(v.versionCode != null ? v.versionCode : v.directoryName);
-            holder.version.setText(v.versionCode != null ? v.versionCode : "");
+            holder.name.setText(getInstanceDisplayName(v));
+            String versionText = getInstanceVersionText(v);
+            holder.version.setText(versionText);
+            holder.version.setVisibility(TextUtils.isEmpty(versionText) ? View.GONE : View.VISIBLE);
             holder.itemView.setActivated(isSelected);
             holder.check.setVisibility(isSelected ? View.VISIBLE : View.GONE);
             holder.tag.setVisibility(View.GONE);
+            applyInstanceSelectionStyle(holder, isSelected);
 
             holder.itemView.setOnClickListener(_v -> {
                 if (listener != null) listener.onClick(v);
             });
         }
 
+        private static void applyInstanceSelectionStyle(@NonNull VH holder, boolean isSelected) {
+            android.content.Context context = holder.itemView.getContext();
+            PersonalizationManager pm = new PersonalizationManager(context);
+            int accent = pm.getAccentColor();
+            if (accent == 0) {
+                accent = ContextCompat.getColor(context, R.color.primary);
+            }
+
+            float density = context.getResources().getDisplayMetrics().density;
+            GradientDrawable background = new GradientDrawable();
+            background.setShape(GradientDrawable.RECTANGLE);
+            background.setCornerRadius(10 * density);
+            if (isSelected) {
+                background.setColor(Color.argb(26, Color.red(accent), Color.green(accent), Color.blue(accent)));
+                background.setStroke(Math.max(1, (int) (1 * density)), accent);
+            } else {
+                background.setColor(Color.TRANSPARENT);
+                background.setStroke(0, Color.TRANSPARENT);
+            }
+            holder.itemView.setBackground(background);
+            holder.check.setImageTintList(ColorStateList.valueOf(accent));
+        }
+
         @Override public int getItemCount() { return filteredVersions.size(); }
 
         static class VH extends RecyclerView.ViewHolder {
             TextView name, version, tag;
-            View check;
+            ImageView check;
             VH(View v) {
                 super(v);
                 name = v.findViewById(R.id.instance_name);
@@ -949,13 +1079,45 @@ import okhttp3.OkHttpClient;
 
      public void setTextMinecraftVersion() {
         if (binding == null) return;
-        String version = versionManager.getSelectedVersion() != null ? versionManager.getSelectedVersion().versionCode : null;
-        binding.textMinecraftVersion.setText(TextUtils.isEmpty(version) ? getString(R.string.not_found_version) : version);
+        GameVersion selectedVersion = versionManager.getSelectedVersion();
+        String instanceName = selectedVersion != null ? getInstanceDisplayName(selectedVersion) : null;
+        binding.textMinecraftVersion.setText(TextUtils.isEmpty(instanceName) ? getString(R.string.not_found_version) : instanceName);
+    }
+
+    private static String getInstanceDisplayName(GameVersion version) {
+        if (version == null) return "";
+
+        String displayName = stripVersionSuffix(version.displayName, version.versionCode);
+        if (!TextUtils.isEmpty(displayName)) return displayName;
+        if (!TextUtils.isEmpty(version.directoryName)) return version.directoryName;
+        return !TextUtils.isEmpty(version.versionCode) ? version.versionCode : "";
+    }
+
+    private static String getInstanceVersionText(GameVersion version) {
+        if (version == null) return "";
+        if (!TextUtils.isEmpty(version.versionCode)) return version.versionCode;
+        return !TextUtils.isEmpty(version.directoryName) ? version.directoryName : "";
+    }
+
+    private static String stripVersionSuffix(String displayName, String versionCode) {
+        if (TextUtils.isEmpty(displayName)) return "";
+
+        String trimmedName = displayName.trim();
+        if (TextUtils.isEmpty(versionCode)) return trimmedName;
+
+        String suffix = " (" + versionCode + ")";
+        if (trimmedName.endsWith(suffix)) {
+            return trimmedName.substring(0, trimmedName.length() - suffix.length()).trim();
+        }
+        return trimmedName;
     }
 
     private void handleIncomingFiles() {
         if (fileHandler == null) return;
         Intent intent = getIntent();
+        if (MinecraftImportIntents.isMinecraftResourceIntent(this, intent)) {
+            return;
+        }
         if (intent != null && intent.getData() != null) {
             Uri data = intent.getData();
             if ("minecraft".equals(data.getScheme())) {
@@ -983,10 +1145,30 @@ import okhttp3.OkHttpClient;
         }, false);
     }
 
+    private boolean forwardIncomingMinecraftResourceToRunningGame() {
+        Intent intent = getIntent();
+        if (!MinecraftImportIntents.isMinecraftResourceIntent(this, intent)) {
+            return false;
+        }
+        if (!MinecraftImportIntents.forwardToRunningMinecraft(this, intent)) {
+            return false;
+        }
+
+        clearIncomingIntent();
+        return true;
+    }
+
+    private void clearIncomingIntent() {
+        Intent cleanIntent = new Intent(this, MainActivity.class);
+        setIntent(cleanIntent);
+    }
+
     private void handleMinecraftUriLaunch() {
         Intent intent = getIntent();
         if (intent == null) return;
         if (intent.getBooleanExtra("LAUNCH_WITH_URI", false)) {
+            intent.removeExtra("LAUNCH_WITH_URI");
+            setIntent(intent);
             binding.getRoot().post(this::launchGame);
         }
     }
