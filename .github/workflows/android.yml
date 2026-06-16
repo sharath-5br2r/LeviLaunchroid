@@ -89,21 +89,21 @@ jobs:
       - name: Build Release APK
         run: ./gradlew assembleRelease
 
-      - name: Download Android testkey
+      - name: Decode Keystore
         run: |
-          wget -q -O testkey.pk8 "https://raw.githubusercontent.com/aosp-mirror/platform_build/master/target/product/security/testkey.pk8"
-          wget -q -O testkey.x509.pem "https://raw.githubusercontent.com/aosp-mirror/platform_build/master/target/product/security/testkey.x509.pem"
-
+          echo "${{ secrets.SIGNING_KEY_STORE }}" | base64 --decode > ks.keystore
       - name: Install apksigner
         run: sudo apt-get install -y apksigner
 
-      - name: Sign APK with testkey
+      - name: Sign APK with key
         run: |
           APK_IN=$(find app/build/outputs/apk/release -name "*.apk" | head -1)
           APK_OUT="LeviLauncher-${GITHUB_REF_NAME}-release.apk"
           apksigner sign \
-            --key testkey.pk8 \
-            --cert testkey.x509.pem \
+            --ks ks.keystore \
+            --ks-type pkcs12 \
+            --ks-key-alias ${{ secrets.SIGNING_KEY_ALIAS }} \
+            --ks-pass pass:${{ secrets.SIGNING_KEY_PASSWORD }} \
             --v1-signing-enabled true \
             --v2-signing-enabled true \
             --v3-signing-enabled true \
@@ -115,8 +115,9 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: "LeviLauncher Unlocked ${{ github.ref_name }}"
+          repository: sharath-5br2r/patched-apks-builder
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          tag_name: all
           files: ${{ env.APK_OUT }}
           generate_release_notes: true
         env:
